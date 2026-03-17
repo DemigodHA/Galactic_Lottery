@@ -1,162 +1,145 @@
-# galactic_lottery_secp256k1_same_line.py
-
-import sys
 import hashlib
+import secrets
 import base58
-from math import log, ceil
-from bitarray import bitarray
-
-# Python bindings for libsecp256k1
-import secp256k1
-
-# Keys from KeyDatabase.py — assumed to be a list of hex-encoded strings.
+import numpy as np
+import pyopencl as cl
+from ecdsa import SigningKey, SECP256k1
 from KeyDatabase import satoshi_keys
 
+# 1. Pre-process the target keys into a 2D numpy array for OpenCL compatibility
+# A 160-bit RIPEMD-160 hash fits exactly into five 32-bit unsigned integers.
+satoshi_array = np.zeros((len(satoshi_keys), 5), dtype=np.uint32)
+for i, hex_str in enumerate(satoshi_keys):
+    for j in range(5):
+        satoshi_array[i, j] = int(hex_str[j*8:(j+1)*8], 16)
 
-def hash_key(key_bytes: bytes) -> bytes:
-    """
-    Hashes a public key (in bytes) using SHA-256, then RIPEMD-160.
-    Returns the raw RIPEMD-160 bytes.
-    """
-    sha_result = hashlib.sha256(key_bytes).digest()
-    ripe = hashlib.new('ripemd160')
-    ripe.update(sha_result)
-    return ripe.digest()
+# 2. OpenCL C Kernel Code (Runs directly on the Intel Iris Xe Execution Units)
+kernel_code = """
+__kernel void check_key_gpu(__global const unsigned int *hashed_keys,
+                            __global const unsigned int *target_keys,
+                            __global int *found_key,
+                            const int num_hashed,
+                            const int num_targets) {
+    // Get the global ID (the current thread/key index being processed)
+    int idx = get_global_id(0);
+    
+    // Protect against out-of-bounds memory access
+    if (idx < num_hashed) {
+        for (int i = 0; i < num_targets; i++) {
+            int match = 1;
+            // Compare the 5 chunks of 32-bit integers
+            for (int j = 0; j < 5; j++) {
+                if (hashed_keys[idx * 5 + j] != target_keys[i * 5 + j]) {
+                    match = 0;
+                    break;
+                }
+            }
+            
+            if (match == 1) {
+                // If found, write the index back to the result buffer
+                found_key[0] = idx;
+                return; // Stop checking
+            }
+        }
+    }
+}
+"""
 
+def get_intel_gpu_context():
+    """Automatically searches the system for an Intel GPU to bind to."""
+    try:
+        for platform in cl.get_platforms():
+            for device in platform.get_devices(cl.device_type.GPU):
+                if "Intel" in device.vendor or "Intel" in device.name:
+                    print(f"[*] Successfully bound to GPU: {device.name}")
+                    return cl.Context([device])
+    except Exception:
+        pass
+    
+    print("[!] Auto-select failed. Prompting for manual device selection...")
+    return cl.create_some_context()
 
-def private_key_to_wif(private_key_bytes: bytes, compressed: bool = True) -> str:
-    """
-    Converts a 32-byte private key (raw bytes) into WIF (Wallet Import Format).
-    """
-    # Ensure the private key is 32 bytes. If not, pad or handle accordingly.
-    if len(private_key_bytes) != 32:
-        raise ValueError("Private key must be 32 bytes.")
-
-    # Add a prefix byte (0x80 for mainnet private key).
-    prefix = b'\x80' + private_key_bytes
-
-    # If the private key will correspond to a compressed public key, append 0x01.
+def private_key_to_wif(private_key, compressed=True):
+    private_key_bytes = private_key.to_bytes(32, byteorder='big')
+    prefixed_key = b'\x80' + private_key_bytes
     if compressed:
-        prefix += b'\x01'
-
-    # Calculate the double SHA-256 checksum (first 4 bytes).
-    checksum = hashlib.sha256(hashlib.sha256(prefix).digest()).digest()[:4]
-
-    # Create WIF by Base58 encoding the prefix + checksum.
-    return base58.b58encode(prefix + checksum).decode('utf-8')
-
-
-def create_bloom_filter(keys: list[bytes], error_rate: float = 0.1):
-    """
-    Creates a Bloom filter for the given list of byte-strings (keys).
-    :param keys: List of keys in bytes.
-    :param error_rate: Desired false-positive probability.
-    :return: (bloom_filter, num_hashes)
-    """
-    num_keys = len(keys)
-    # Calculate the optimal size (in bits) for the Bloom filter.
-    bit_size = ceil(-num_keys * log(error_rate) / (log(2) ** 2))
-    # Calculate the optimal number of hash functions.
-    num_hashes = ceil(bit_size / num_keys * log(2))
-
-    bloom_filter = bitarray(bit_size)
-    bloom_filter.setall(False)
-
-    # Insert each key into the Bloom filter using multiple hash functions.
-    for key in keys:
-        for i in range(num_hashes):
-            digest = hashlib.sha256(i.to_bytes(2, 'big') + key).digest()
-            index = int.from_bytes(digest, byteorder='big') % bit_size
-            bloom_filter[index] = True
-
-    return bloom_filter, num_hashes
-
-
-def is_key_match(candidate_key: bytes, bloom_filter: bitarray, num_hashes: int) -> bool:
-    """
-    Checks whether a candidate key might be in the Bloom filter.
-    :param candidate_key: The key (in bytes) to check.
-    :param bloom_filter: Bloom filter bitarray.
-    :param num_hashes: Number of hash functions used to build the filter.
-    :return: Boolean indicating potential membership.
-    """
-    size = len(bloom_filter)
-    for i in range(num_hashes):
-        digest = hashlib.sha256(i.to_bytes(2, 'big') + candidate_key).digest()
-        index = int.from_bytes(digest, byteorder='big') % size
-        if not bloom_filter[index]:
-            return False
-    return True
-
-
-def try_keys(
-    bloom_filter: bitarray,
-    num_hashes: int,
-    attempts: int,
-    satoshi_set: set[bytes],
-    print_interval: int = 10_000
-):
-    """
-    Continuously generates private keys using secp256k1, checks them against the Bloom filter,
-    and then verifies membership in the known Satoshi keys set.
-    Prints progress on the same line every 'print_interval' attempts (using carriage return).
-    :param bloom_filter: The Bloom filter.
-    :param num_hashes: Number of hash functions used.
-    :param attempts: Starting attempt count.
-    :param satoshi_set: A set of raw bytes for the known Satoshi keys.
-    :param print_interval: Print progress every 'print_interval' attempts.
-    :return: WIF string if found, None otherwise.
-    """
-    while True:
-        # Generate a random private key using libsecp256k1
-        priv_key_obj = secp256k1.PrivateKey()  # random
-        priv_key_bytes = priv_key_obj.private_key  # 32 raw bytes
-
-        # Get the compressed public key (33 bytes).
-        pub_key_bytes = priv_key_obj.pubkey.serialize(compressed=True)
-
-        # Hash the compressed public key with SHA-256 then RIPEMD-160.
-        hashed_key = hash_key(pub_key_bytes)
-
-        # Check Bloom filter first (fast).
-        if is_key_match(hashed_key, bloom_filter, num_hashes):
-            # Double-check in the actual set (no false positives).
-            if hashed_key in satoshi_set:
-                # Convert private key bytes to WIF.
-                wif_key = private_key_to_wif(priv_key_bytes)
-                print(f"\nWinning private key found: {wif_key}")
-                return wif_key
-
-        attempts += 1
-
-        # Refresh progress on the same line every 'print_interval' attempts.
-        if attempts % print_interval == 0:
-            # '\r' returns cursor to the start of the line; end='' avoids new line.
-            print(f"\r{attempts} attempts made so far...", end='', flush=True)
-
+        prefixed_key += b'\x01'
+    checksum = hashlib.sha256(hashlib.sha256(prefixed_key).digest()).digest()[:4]
+    wif_key = prefixed_key + checksum
+    return base58.b58encode(wif_key).decode('utf-8')
 
 def main():
-    # Starting attempt counter.
-    attempts = 0
+    attempts = 1_000
+    total_attempts = 0
+    
+    # Max valid space for SECP256k1 Curve
+    N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140
+    
+    # Initialize OpenCL context and execution queue
+    ctx = get_intel_gpu_context()
+    queue = cl.CommandQueue(ctx)
+    mf = cl.mem_flags
+    
+    # Compile the OpenCL C program for your Intel Hardware Just-In-Time
+    prg = cl.Program(ctx, kernel_code).build()
+    
+    # Extract the kernel ONCE to avoid repeated retrieval overhead
+    check_kernel = cl.Kernel(prg, "check_key_gpu")
+    
+    # Send the target database to Intel GPU memory (Only needs to happen once)
+    d_satoshi_keys = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=satoshi_array)
 
-    # Convert known Satoshi keys (stored as hex in KeyDatabase) into raw bytes.
-    satoshi_keys_bytes = [bytes.fromhex(k) for k in satoshi_keys]
-    # Create a set for quick membership checks.
-    satoshi_set = set(satoshi_keys_bytes)
-
-    # Create a Bloom filter with default error_rate=0.1 (adjust as desired).
-    bloom_filter, num_hashes = create_bloom_filter(satoshi_keys_bytes, error_rate=0.1)
-
-    # Try keys forever (or until a match is found, which is astronomically unlikely).
-    found_key = try_keys(bloom_filter, num_hashes, attempts, satoshi_set, print_interval=10_000)
-
-    if found_key:
-        print(f"\nScript finished — match found: {found_key}")
-        sys.exit(0)
-    else:
-        print("\nNo matching private key found (almost certain this will never happen).")
-        sys.exit(1)
-
+    while True:
+        # Search safely inside the curve bounds
+        start_value = secrets.randbelow(N - attempts - 1) + 1
+        private_keys = [start_value + i for i in range(attempts)]
+        
+        hashed_keys_array = np.zeros((attempts, 5), dtype=np.uint32)
+        
+        # Elliptic Curve Math & Hashing on the CPU
+        for i, private_key in enumerate(private_keys):
+            sk = SigningKey.from_secret_exponent(private_key, curve=SECP256k1)
+            vk_bytes = sk.verifying_key.to_string("compressed")
+            
+            sha = hashlib.sha256(vk_bytes).digest()
+            ripe = hashlib.new('ripemd160', sha).digest()
+            
+            for j in range(5):
+                hashed_keys_array[i, j] = int.from_bytes(ripe[j*4:(j+1)*4], byteorder='big')
+        
+        # Setup inputs and output buffers for the GPU block
+        d_hashed_keys = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=hashed_keys_array)
+        
+        found_arr = np.array([-1], dtype=np.int32)
+        d_found_key = cl.Buffer(ctx, mf.WRITE_ONLY | mf.COPY_HOST_PTR, hostbuf=found_arr)
+        
+        # Fire the GPU command payload
+        check_kernel(
+            queue, 
+            (attempts,),      # Global work size
+            None,             # Auto-calculate local block size
+            d_hashed_keys, 
+            d_satoshi_keys, 
+            d_found_key, 
+            np.int32(attempts), 
+            np.int32(len(satoshi_keys))
+        )
+        
+        # Pull the integer result back into Python memory over PCIe
+        cl.enqueue_copy(queue, found_arr, d_found_key)
+        queue.finish()  # Synchronize
+        
+        found_idx = found_arr[0]
+        
+        if found_idx != -1:
+            winning_private_key = private_keys[found_idx]
+            wif_key = private_key_to_wif(winning_private_key)
+            print(f"\n\n[SUCCESS] Winning private key found!\nWIF: {wif_key}")
+            print(f"Hex: {hex(winning_private_key)}")
+            break
+        
+        total_attempts += attempts
+        print(f"\r{total_attempts} attempts made so far. Current key: {hex(start_value + attempts - 1)}", end='', flush=True)
 
 if __name__ == "__main__":
     main()
